@@ -46,21 +46,13 @@ void saveConfig(const char * name, float Rppr, float Lppr, float kp, float ki, f
 void setup() {
   Serial.begin(115200);
   Serial.println();
-
-    saveConfig("Atta-Amarillo-01", 849.6, 853.0, 2.0, 2.0, 0.0);
-  Serial.println("Atta Credentials Saved using Preferences");
-
-
-  loadConfig();
-
-  Serial.print("Loaded device name: [");
-  Serial.print(deviceName);
-  Serial.println("]");
+  Serial.println("Este sketch es legado: ya no cargue primero Preferences.ino.");
+  Serial.println("Use CodigoESP32.ino y su consola Serial (DEV <clave>) para consultar o cambiar valores.");
+  Serial.println("No se modifico ninguna preferencia.");
 
 }
 
 void loop() {
   // Intentionally empty.
-  // This sketch only needs to run once at startup to write the credentials.
+  // Este sketch ya no escribe credenciales; use CodigoESP32.ino.
 }
-

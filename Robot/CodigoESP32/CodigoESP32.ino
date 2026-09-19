@@ -19,46 +19,7 @@ using namespace std;
 
 // Robot constants
 
-Preferences prefs;
-
-float rightPulsesPerRev = 0;
-float leftPulsesPerRev = 0;
-float kpSpeed = 0;
-float kiSpeed = 0;
-float kdSpeed = 0.0;
-String deviceName = "";
-
-
-void loadConfig() {
-  prefs.begin("Atta-Creds", true); // true = read-only
-  deviceName = prefs.getString("deviceName", "");
-  rightPulsesPerRev = prefs.getFloat("Rppr", 0.0);
-  leftPulsesPerRev = prefs.getFloat("Lppr", 0.0);
-  kpSpeed = prefs.getFloat("kp", 0.0);
-  kiSpeed = prefs.getFloat("ki", 0.0);
-  kdSpeed = prefs.getFloat("kd", 0.0);
-  prefs.end();
-}
-
-const int samplingTime = 25; // units: miliseconds
-//const float rightPulsesPerRev = 834; // number of pulses from a single encoder output, for the right motor
-//const float leftPulsesPerRev = 834; // number of pulses from a single encoder output, for the left motor
-const float wheelRadius = 22; // Wheel circumference = 139.5mm
-const float distanceWheelToWheel = 120; // actualizado a chasís v2.4 
-const float distanceCenterToWheel = distanceWheelToWheel / 2 ; // Turning radius of the robot, distance in mm between the center and one wheel
-
-// Constants for PID control with samplingTime = 25ms
-const float targetSpeed = 90.0; // Target speed for the robot in mm/s
-//const float kpSpeed = 2; // Proportional constant for speed control 0.75, 1.1
-//const float kiSpeed = 2; // Integral constant for speed control
-//const float kdSpeed = 0.0; // Derivative constant for speed control (set to zero for no derivative action)
-
-// Constants for PID control implementation
-const int minIntegralErrorSpeed = -255; // Minimum value for integral error to avoid windup
-const int maxIntegralErrorSpeed = 255; // Maximum value for integral error to avoid windup
-
-const int upperDutyCycleLimitSpeed = 200; // Maximum allowed PWM value for speed control
-const int lowerDutyCycleLimitSpeed = 60; // Minimum allowed PWM value for speed control
+#include "RobotConfig.h"
 
 // Constants for RGB LED configuration
 const int duracionParpadeoLed = 500;
@@ -77,47 +38,21 @@ const int distRetrocesoObstaculo = 50;
 // Constante para tener siempre activos (o no) los sensores inferiores (trackers)
 const bool trackersSiempreActivos = false;
 
-// Error accumulation for speed PID control
-float sumErrorVelRight = 0; // Accumulated integral error for the right wheel
-float prevErrorVelRight = 0; // Previous error value for the right wheel (used for derivative calculation)
-float sumErrorVelLeft = 0; // Accumulated integral error for the left wheel
-float prevErrorVelLeft = 0; // Previous error value for the left wheel (used for derivative calculation)
-
-int distanceTraveled = 0; // Variable to track the total distance traveled by the robot
-
-
-int prevPWMRight = 0;
-int prevPWMLeft = 0;
-bool prevReverse = 0;
-
-
-// For speed sampling
-unsigned long previousTime = 0;
-
-// Non-blocking settling time between completed chassis movements.
+// Cambio del delay
 // Keeping it explicit makes it safe to tune from measurements without blocking the loop.
 const unsigned long stopSettlingTime = 500;
 unsigned long stopStartTime = 0;
 bool waitingForStopSettle = false;
 
-// Variables to keep track of the encoder state
-volatile long leftEncoderPos = 0; // Current position of the left encoder (in ticks)
-long leftTicksForSpeed = 0; // Number of encoder ticks counted for left wheel speed calculation
-long leftPrevTicks = 0; // Previous encoder tick count for the left wheel (used to calculate speed) 
-volatile long rightEncoderPos = 0; // Current position of the right encoder (in ticks)
-long rightTicksForSpeed = 0; // Number of encoder ticks counted for right wheel speed calculation
-long rightPrevTicks = 0; // Previous encoder tick count for the right wheel (used to calculate speed)
+// Contadores acumulativos x4; snapshot coherente compartido con las ISR.
+portMUX_TYPE encoderMux = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t rightEncoderPos = 0, leftEncoderPos = 0;
 
-// Variables to store the servo position
-const int activateAngle = 87;  // Activated Tool
-const int deactivateAngle = 118; // Deactivated Tool
+// Variables to store the servo position (loaded from Preferences at startup)
 int set = 0;
 
 //Variables del servomotor 360 del set de herramientas
 const int pinServo360 = 23;
-const int velocidadPositiva = 115; // ###
-const int velocidadNegativa = 70; // ###
-const int velocidadNeutra = 90; // ###
 
 // Create a Servo object to control the MG90S
 Servo myServo;
@@ -185,9 +120,11 @@ string mensajeBLE="ATINIAV020GD030CI003RE010GI090CIFINATFIN";
 BLEServer *pServer = NULL;               // Represents this ESP32 acting as a BLE server
 BLECharacteristic *pCharacteristic = NULL; // Pointer to the read/write characteristic 
 
-bool deviceConnected = false;   // true while a central (the App) is connected 
-bool nuevoMensajeBLE = false;   // true when a new write has arrived and hasn't been processed yet
-string mensajeBLEBuffer = "";   // Temporary storage for the incoming message, filled inside the callback
+volatile bool deviceConnected = false;   // true while a central (the App) is connected
+volatile bool nuevoMensajeBLE = false;   // true when a new write has arrived and hasn't been processed yet
+char mensajeBLEBuffer[501] = {};
+portMUX_TYPE bleMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool bleStopPending = false;
 
 //***************************************************************************************
 // Callback class for connection/disconnection events.
@@ -215,10 +152,18 @@ class MyServerCallbacks: public BLEServerCallbacks {
 class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
       String valorRecibido = pCharacteristic->getValue();
-      if (valorRecibido.length() > 0) {
-        mensajeBLEBuffer = string(valorRecibido.c_str());
+      if (valorRecibido.length() == 0 || valorRecibido.length() > 500) return;
+      // STOP tiene prioridad y no puede perderse por otro mensaje posterior.
+      bool stopRequested = false;
+      for (unsigned int i = 0; i + 5 <= valorRecibido.length(); i += 5)
+        if (valorRecibido.substring(i, i + 5) == "PARAR") stopRequested = true;
+      portENTER_CRITICAL(&bleMux);
+      if (stopRequested) bleStopPending = true;
+      else {
+        memcpy(mensajeBLEBuffer, valorRecibido.c_str(), valorRecibido.length() + 1);
         nuevoMensajeBLE = true;
       }
+      portEXIT_CRITICAL(&bleMux);
     }
 };
 
@@ -292,33 +237,28 @@ const short tiempoGrua = 4000;//###;
 short tiempoDeAccion=0;
 short velocidad=velocidadNeutra; 
 
-//******************************************************************************************************************
-// Function that updates the position of the right wheel encoder.
-//
-// This function increments the encoder position counter for the right wheel each time it is called. The counter 
-// reflects the accumulated encoder pulses, allowing for the calculation of distance or speed based on pulses.
-//
-//******************************************************************************************************************
-void rightUpdateEncoder() {
-  // Update encoder positions based on direction
-  rightEncoderPos ++;
+#include "MotionRuntime.h"
 
+void ARDUINO_ISR_ATTR rightUpdateEncoder() {
+  portENTER_CRITICAL_ISR(&encoderMux);
+  ++rightEncoderPos;
+  portEXIT_CRITICAL_ISR(&encoderMux);
 }
-
-//******************************************************************************************************************
-// Function that updates the position of the left wheel encoder.
-//
-// This function increments the encoder position counter for the left wheel each time it is called. The counter 
-// reflects the accumulated encoder pulses, which can be used to determine distance or speed based on pulse count.
-//
-//******************************************************************************************************************
-void leftUpdateEncoder() {
-  // Update encoder positions based on direction
-  leftEncoderPos ++;
+void ARDUINO_ISR_ATTR leftUpdateEncoder() {
+  portENTER_CRITICAL_ISR(&encoderMux);
+  ++leftEncoderPos;
+  portEXIT_CRITICAL_ISR(&encoderMux);
 }
-
 
 void setup() {
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+  loadConfig(); // Lee (o inicializa una vez) la configuracion persistente.
+
+  Serial.print("Loaded device name: [");
+  Serial.print(deviceName);
+  Serial.println("]");
+  Serial.println("Serial listo. Para configurar: DEV <clave>");
 
   FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
   FastLED.setBrightness(255); 
@@ -326,13 +266,14 @@ void setup() {
   // Set the PWM properties (50 Hz is typical for servos)
   myServo.setPeriodHertz(50);    // Standard 50Hz servo
   myServo.attach(servoPin, 500, 2400);  // Attach the servo on the pin with min/max pulse widths
+  myServo.write(neutralAngle);   // Lleva el lápiz a neutral al encender el Atta
 
   // Set encoder pins as inputs
   pinMode(rightEncoderA, INPUT_PULLUP);
   pinMode(rightEncoderB, INPUT_PULLUP);
 
   pinMode(leftEncoderA, INPUT_PULLUP);
-  pinMode(leftEncoderB, INPUT_PULLUP);
+  pinMode(leftEncoderB, INPUT); // GPIO35 no tiene pull-up interno; verificar circuito externo.
 
   pinMode(rightMotorM1, OUTPUT);
   pinMode(rightMotorM2, OUTPUT);
@@ -355,8 +296,17 @@ void setup() {
 
   // Setup servo360
   pinMode(pinServo360, OUTPUT);
+  servoHerramientaSet.setPeriodHertz(50);
   servoHerramientaSet.attach(pinServo360);
   servoHerramientaSet.write(velocidadNeutra);
+
+  // Reservar ambos servos ANTES de que LEDC asigne canales para motores/LED.
+  // Frecuencia explícita igual al analogWrite anterior: 1 kHz, resolución 8 bits.
+  motorOutputsReady = myServo.attached() && servoHerramientaSet.attached();
+  for (int pin : {rightMotorM1, rightMotorM2, leftMotorM1, leftMotorM2})
+    motorOutputsReady = ledcAttach(pin, 1000, 8) && motorOutputsReady;
+  stopMotion();
+  if (!motorOutputsReady) Serial.println("ERROR PWM: no se pudieron reservar canales; movimiento bloqueado.");
 
   // Señal de batería baja set up
   pinMode(pinBateriaBaja, INPUT_PULLUP);
@@ -368,13 +318,6 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(leftEncoderA), leftUpdateEncoder, CHANGE);
   attachInterrupt(digitalPinToInterrupt(leftEncoderB), leftUpdateEncoder, CHANGE);
 
-  Serial.begin(115200);
-
-   loadConfig(); //Carga Parámetros de configuración desde la memoria no volátil del ESP32. Credentials/Preferences
-
-    Serial.print("Loaded device name: [");
-    Serial.print(deviceName);
-    Serial.println("]");
     //Inicialización comunicación bluetooth BLE
 
   //***************************************************************************************
@@ -417,7 +360,13 @@ void setup() {
 
 
 void loop() {
- 
+  readDeveloperSerial();
+  // Procesar STOP también durante reposo de parada y retroceso por obstáculo.
+  if (bleStopPending || nuevoMensajeBLE || millis() - tiempoPasadaLecturaBT >= 50) {
+    leerBluetooth();
+    tiempoPasadaLecturaBT = millis();
+  }
+  updateMotorTest();
   
 
   lecturaInfrarrojoDerecho=digitalRead(rightInfraredSensor);
@@ -495,26 +444,15 @@ void loop() {
           }  // estado se mantiene igual, se salta el resto de comparaciones y lee nueva instruccion   
       
       }else if (instruccion == inst_Avanzar) {
-        rightEncoderPos = 0; 
-        leftEncoderPos = 0;
         estado = MOVERSE;
       }else if (instruccion == inst_Retroceder) {
         estado = MOVERSE;
         valor_instruccion = valor_instruccion * -1;
-        rightEncoderPos = 0; 
-        leftEncoderPos = 0;
-
       }else if (instruccion == inst_GiroIzquierdo) {
         estado = GIRAR;
         valor_instruccion = valor_instruccion * -1;
-        rightEncoderPos = 0;
-        leftEncoderPos = 0;
-
       }else if (instruccion == inst_GiroDerecho) {
         estado = GIRAR;
-        rightEncoderPos = 0;
-        leftEncoderPos = 0;
-      
       }else if (instruccion == inst_CicloInicia  ||  instruccion == inst_CicloFin) {
         estado = CICLO;
 
@@ -541,7 +479,7 @@ void loop() {
 
       //Ejecuta el estado de avanzar o retroceder
       //(es el mismo pero con distancia negativa)
-      movimiento_listo= advanceDesiredDistance(valor_instruccion*10);
+      movimiento_listo= advanceDesiredDistance(diagnosticMove ? diagnosticAmount : valor_instruccion*10);
 
       // Leer la conexión BLE periódicamente
       if (millis() >= tiempoPasadaLecturaBT + esperaBT) {
@@ -577,7 +515,7 @@ void loop() {
       //(es el mismo pero con ángulo negativo)
 
       //giro
-      movimiento_listo= turnDesiredAngle(valor_instruccion);
+      movimiento_listo= turnDesiredAngle(diagnosticMove ? diagnosticAmount : valor_instruccion);
 
       // Leer la conexión BLE periódicamente
       if (millis() >= tiempoPasadaLecturaBT + esperaBT) {
@@ -613,7 +551,7 @@ void loop() {
       if (!waitingForStopSettle) {
         if (paro_emergencia || obstaculo_detectado) { //en caso de apretar STOP o detectar obstaculo
           flagEjecucion = 0;
-          configureHBridge(false, 3, 0, 0); //Detiene el robot
+          stopMotion(); // mismo reinicio para STOP y obstáculo
         } // Ojo que la funcion avanzar y girar ya detiene el robot al final
 
         stopStartTime = millis();
@@ -633,10 +571,13 @@ void loop() {
         paro_emergencia=false;
         estado = ESPERA;
       } else if (obstaculo_detectado){
-        // Se reinician los valores de posición para que no tome en cuenta el movimiento recién interrumpido
-        rightEncoderPos = 0;
-        leftEncoderPos = 0;
+        // El controlador toma nuevos orígenes al iniciar el retroceso.
         estado = MOVIMIENTO_OBSTACULO;
+      } else if (diagnosticMove) {
+        diagnosticMove = false;
+        flagEjecucion = false;
+        estado = ESPERA;
+        Serial.println("MOVE_DONE");
       } else {
         estado = LEE_MEMORIA;
       }
@@ -688,7 +629,11 @@ void loop() {
       flagObstaculo = 0;
       
       // Lógica estado siguiente
-      if (retroceso_listo) {
+      if (paro_emergencia) {
+        estado = DETENERSE;
+      } else if (retroceso_listo) {
+        diagnosticMove = false;
+        flagEjecucion = false;
         estado = ESPERA;
       } 
       break;
@@ -743,6 +688,7 @@ void loop() {
 
   }
 
+  emitTelemetry();
   flancoNegRecibeProgra = 0;
   // Reseteo de la señal de recibeProgra
   if (recibeProgra && millis() > recibePrograTiempo0 + duracionIndicadorRecibeProgra) {
@@ -1160,28 +1106,27 @@ void Interpreta_mensajeBLE (string mensaje) {
 //led en azul.
 //***************************************************************************************
 void leerBluetooth() {
-  // deviceConnected is updated automatically by MyServerCallbacks 
-  flagBluetooth = deviceConnected; // Este flag se usa para el parpadeo del led azul, que indica si hay conexión BLE.
-
-  if (deviceConnected && nuevoMensajeBLE) {
-    mensajeBLE = mensajeBLEBuffer;
-    Serial.println(mensajeBLE.c_str());
-
-    // Clears the flag so the same message isn't processed again next loop
-    // replaces: caracteristico.writeValue("")
-    nuevoMensajeBLE = false;
-
-    Interpreta_mensajeBLE(mensajeBLE);
-    if (!flagParar) {
-      recibeProgra = 1;
-      recibePrograTiempo0 = millis();
-    }
-  }
+  flagBluetooth = deviceConnected;
+  char incoming[501];
+  bool pending, stopRequested;
+  portENTER_CRITICAL(&bleMux);
+  stopRequested = bleStopPending;
+  bleStopPending = false;
+  pending = nuevoMensajeBLE;
+  if (pending) memcpy(incoming, mensajeBLEBuffer, sizeof(incoming));
+  nuevoMensajeBLE = false;
+  portEXIT_CRITICAL(&bleMux);
+  if (stopRequested) { requestMotionStop(); return; }
+  if (!deviceConnected || !pending) return;
+  mensajeBLE = incoming;
+  if (mensajeBLE.size() % 5 != 0) return;
+  // No reemplazar un programa ni su geometría durante una maniobra.
+  if (!calibrationIdle() || !configReady || motion.fault != atta::Fault::None) return;
+  Interpreta_mensajeBLE(mensajeBLE);
+  if (paro_emergencia) { requestMotionStop(); return; }
+  recibeProgra = 1;
+  recibePrograTiempo0 = millis();
 }
-
-
-
-
 
 //******************************************************************************************************************
 // Function that controls the servo based on the variable `set`. If `set` is 1, the tool is activated; otherwise, it is deactivated.
@@ -1201,410 +1146,6 @@ bool controlServo(bool set) {
   }
   delay(500); // so that the next action does not start before the servo stops moving
   return true;  // Action completed
-}
-
-//******************************************************************************************************************
-// Function that controls the speed of the wheels using a PID controller based on the reference and actual speeds.
-//
-// This function calculates a PWM output for the motors by applying a PID control loop to match the actual speed to a setpoint.
-//
-// @param refSpeed The target speed for the motor.
-// @param actualSpeed The current speed of the motor.
-// @param sumErrorSpeed Accumulated integral error for the speed PID.
-// @param prevErrorSpeed Previous speed error for the derivative calculation.
-//
-// @return The computed PWM signal as an integer to control the motor speed.
-//******************************************************************************************************************
-int controlWheelSpeed(float refSpeed, float actualSpeed, float& sumErrorSpeed, float& prevErrorSpeed) {
-  
-  // Calculate the error between the reference speed and the actual speed
-  float errorSpeed = refSpeed - actualSpeed;
-
-  // Update the integral error by accumulating the current error over time
-  // Multiply by 0.01 to scale the contribution of the error (based on sampling time)
-  sumErrorSpeed += errorSpeed * 0.01;
-
-  // Constrain the integral error to avoid windup
-  sumErrorSpeed = constrain(sumErrorSpeed, minIntegralErrorSpeed , maxIntegralErrorSpeed);
-
-  // Calculate the derivative of the error (difference between current and previous error)
-  float diffErrorSpeed = (errorSpeed - prevErrorSpeed);
-
-  // PID control equation to calculate the control output
-  float pidOutput = (kpSpeed * errorSpeed) + (kiSpeed * sumErrorSpeed) + (kdSpeed * diffErrorSpeed);
-
-  // Constrain the PID output to avoid saturation and ensure it stays within motor PWM limits
-  pidOutput = constrain((int)pidOutput, lowerDutyCycleLimitSpeed, upperDutyCycleLimitSpeed);
-
-  // Update the previous error for the next iteration of the control loop
-  prevErrorSpeed = errorSpeed;
-  
-  // Return the calculated PWM value as an integer
-  return (int)pidOutput;
-}
-
-//******************************************************************************************************************
-// Function that moves the robot a desired linear distance using PID control to maintain speed and direction.
-//
-// This function continuously calculates the speed of each wheel, adjusts the motor PWM values, and checks if the robot has reached the desired distance.
-//
-// @param desiredDistance The target distance in mm that the robot should travel.
-//
-// @return true if the desired distance is reached; false otherwise.
-//******************************************************************************************************************
-bool advanceDesiredDistance(int desiredDistance) {
-
-  // Flag to indicate if the robot should move in reverse
-  bool reverse = false;
-
-  // Create a time condition using millis to apply a sampling time without delays
-  unsigned long currentTime = millis(); // Get the current time in milliseconds
-  unsigned long deltaTime = currentTime - previousTime; // Time elapsed since the last sample
-
-  // Check if the elapsed time has reached the sampling time (10 ms)
-  if (deltaTime >= samplingTime) {
-    previousTime = currentTime; // Reset previous time for the next sample
-
-    // Convert deltaTime to seconds
-    float deltaTimeSec = deltaTime / 1000.0;
-
-
-    // Calculate the number of encoder ticks since the last sample
-    rightTicksForSpeed = rightEncoderPos - rightPrevTicks;
-    leftTicksForSpeed = leftEncoderPos - leftPrevTicks;
-
-    
-    // Calculate the current speeds of both wheels based on the encoder ticks
-    float actualSpeedLeft = calculateSpeed(leftTicksForSpeed, deltaTimeSec, 1); // Speed of the left wheel in mm/s
-    float actualSpeedRight = calculateSpeed(rightTicksForSpeed, deltaTimeSec, 0); // Speed of the right wheel in mm/s
-
-    // Update the previous encoder tick counts
-    rightPrevTicks = rightEncoderPos;
-    leftPrevTicks = leftEncoderPos;
-
-
-    // Set desired speeds
-
-    if (desiredDistance < 0) { // If the desired distance is negative, move in reverse
-        reverse = true;
-    }
-
-    float speedSetPoint = targetSpeed; // Define the target speed for both wheels (in mm/s)
-
-    // PID control loop for speed to calculate PWM values for both wheel
-    int pwmRightWheel = controlWheelSpeed(speedSetPoint, actualSpeedRight, sumErrorVelRight, prevErrorVelRight);
-    int pwmLeftWheel = controlWheelSpeed(speedSetPoint, actualSpeedLeft, sumErrorVelLeft, prevErrorVelLeft);
-
-
-
-    // Determine if the PWM values for the right and left wheels have changed
-    bool rightChanged = (prevPWMRight != pwmRightWheel); // Check if right wheel needs to be updated
-    bool leftChanged = (prevPWMLeft != pwmLeftWheel); // Check if left wheel needs to be updated
-    bool reverseChanged = (prevReverse != reverse); // Check if both wheels need to be updated
-
-    // Update the H-Bridge configuration if there are changes in the PWM values
-    if (rightChanged) {
-      configureHBridge(reverse, 1, pwmRightWheel, pwmLeftWheel);// Update the right motor control
-    }
-    if (leftChanged) {
-      configureHBridge(reverse, 2, pwmRightWheel, pwmLeftWheel);// Update the left motor control
-    }
-    if ((rightChanged && leftChanged) || reverseChanged) {
-      configureHBridge(reverse, 3, pwmRightWheel, pwmLeftWheel); // Update both motors if both values changed or if direction changed
-    }
-
-    // Store the current PWM values for comparison in the next iteration
-    prevPWMRight = pwmRightWheel;
-    prevPWMLeft = pwmLeftWheel;
-    prevReverse = reverse;
-
-    
-    // Calculate the distance traveled by the robot using encoder data
-    float distanceTraveled = calculateLinearDistanceTraveled(leftEncoderPos, rightEncoderPos);
-
-    // Check if the robot has traveled the desired distance
-    if (abs(distanceTraveled) >= abs(desiredDistance)) {
-
-      // If the desired distance is reached, stop the robot
-      configureHBridge(reverse, 3, 0, 0);
-
-      // Reset PID control values
-      sumErrorVelRight = 0;
-      prevErrorVelRight = 0;
-      sumErrorVelLeft = 0;
-      prevErrorVelLeft = 0;
-
-      // Reset encoder tick counts
-      rightPrevTicks = 0;
-      leftPrevTicks = 0;
-
-      rightEncoderPos = 0;
-      leftEncoderPos = 0;
-
-      return true; // Return true to indicate that the desired distance has been reached
-    }
-
-  }
-  return false; // Return false if the robot has not yet reached the desired distance
-}
-
-//******************************************************************************************************************
-// Function that turns the robot to a specified angle using PID control for each wheel's speed.
-//
-// This function calculates the speed of each wheel, updates the H-Bridge configuration to turn, and checks if the robot has turned to the desired angle.
-//
-// @param desiredAngle The target angle in degrees for the robot to turn.
-//
-// @return true if the desired angle is reached; false otherwise.
-//******************************************************************************************************************
-bool turnDesiredAngle (int desiredAngle) {
-
-  // Flag to indicate if the robot should turn in counterClockwise
-  bool counterClockwise = false;
-
-  if (desiredAngle < 0) { // If the desired angle is negative, move in counterClockwise
-    counterClockwise = true;
-  }
-
-  // Create a time condition using millis to apply a sampling time without delays
-  unsigned long currentTime = millis(); // Get the current time in milliseconds
-  unsigned long deltaTime = currentTime - previousTime; // Time elapsed since the last sample
-
-
-  // Calculate the linear distance required for the given angle
-  float desiredDistance = calculateLinearDistanceDesired(desiredAngle);
-
-  // Check if the elapsed time has reached the sampling time (10 ms)
-  if (deltaTime >= samplingTime) {
-    previousTime = currentTime; // Reset previous time for the next sample
-
-    // Convert deltaTime to seconds
-    float deltaTimeSec = deltaTime / 1000.0;
-
-
-    // Calculate the number of encoder ticks since the last sample
-    rightTicksForSpeed = rightEncoderPos - rightPrevTicks;
-    leftTicksForSpeed = leftEncoderPos - leftPrevTicks;
-
-    
-    // Calculate the current speeds of both wheels based on the encoder ticks
-    float actualSpeedLeft = calculateSpeed(leftTicksForSpeed, deltaTimeSec, 1); // Speed of the left wheel in mm/s
-    float actualSpeedRight = calculateSpeed(rightTicksForSpeed, deltaTimeSec, 0); // Speed of the right wheel in mm/s
-
-    // Update the previous encoder tick counts
-    rightPrevTicks = rightEncoderPos;
-    leftPrevTicks = leftEncoderPos;
-
-
-    // Set desired speeds
-
-    float speedSetPoint = targetSpeed; // Define the target speed for both wheels (in mm/s)
-
-    // PID control loop for speed to calculate PWM values for both wheel
-    int pwmRightWheel = controlWheelSpeed(speedSetPoint, actualSpeedRight, sumErrorVelRight, prevErrorVelRight);
-    int pwmLeftWheel = controlWheelSpeed(speedSetPoint, actualSpeedLeft, sumErrorVelLeft, prevErrorVelLeft);
-
-    // Determine if the PWM values for the right and left wheels have changed
-    bool rightChanged = (prevPWMRight != pwmRightWheel); // Check if right wheel needs to be updated
-    bool leftChanged = (prevPWMLeft != pwmLeftWheel); // Check if left wheel needs to be updated
-
-    // Update the H-Bridge configuration if there are changes in the PWM values
-    if (rightChanged) {
-      configureHBridgeTurn(counterClockwise, 1, pwmRightWheel, pwmLeftWheel);// Update the right motor control
-    }
-    if (leftChanged) {
-      configureHBridgeTurn(counterClockwise, 2, pwmRightWheel, pwmLeftWheel);// Update the left motor control
-    }
-    if (rightChanged && leftChanged) {
-      configureHBridgeTurn(counterClockwise, 3, pwmRightWheel, pwmLeftWheel); // Update both motors if both values changed
-    }
-
-    // Store the current PWM values for comparison in the next iteration
-    prevPWMRight = pwmRightWheel;
-    prevPWMLeft = pwmLeftWheel;
-
-    // Calculate the distance traveled by the robot using encoder data
-    float distanceTraveled = calculateLinearDistanceTraveled(leftEncoderPos, rightEncoderPos);
-
-    // Check if the robot has traveled the desired distance
-    if (abs(distanceTraveled) >= abs(desiredDistance)) {
-
-      // If the desired distance is reached, stop the robot
-      configureHBridgeTurn(counterClockwise, 3, 0, 0);
-
-      // Reset PID control values
-      sumErrorVelRight = 0;
-      prevErrorVelRight = 0;
-      sumErrorVelLeft = 0;
-      prevErrorVelLeft = 0;
-
-      // Reset encoder tick counts
-      rightPrevTicks = 0;
-      leftPrevTicks = 0;
-
-      rightEncoderPos = 0;
-      leftEncoderPos = 0;
-
-      return true; // Return true to indicate that the desired distance has been reached
-    }
-
-  }
-  return false; // Return false if the robot has not yet reached the desired distance
-}
-
-//******************************************************************************************************************
-// Function that calculates the speed of a wheel based on encoder pulses and elapsed time.
-//
-// The function converts the number of pulses into a linear distance, then calculates the speed in mm/s based on the time interval.
-//
-// @param pulses The number of encoder pulses detected.
-// @param deltaTime The time interval in seconds.
-// @param motorID Whether the calculation is for the right (0) or left (1) motor.
-//
-// @return The calculated speed in mm/s.
-//******************************************************************************************************************
-float calculateSpeed(long pulses, float deltaTime, int motorID) {
-    // Wheel circumference in mm
-    float wheelCircumference = 2 * 3.1416 * wheelRadius;
-
-    // Full revolutions based on the number of pulses
-    float revolutions = 0;
-    if (motorID == 0) { // for right motor
-      revolutions = pulses / rightPulsesPerRev;
-    } else { // for left motor (id = 1)
-      revolutions = pulses / leftPulsesPerRev;
-    }
-    
-
-    // Distance traveled in mm
-    float distance = revolutions * wheelCircumference;
-
-    //Speed mm/s
-
-    float vel = distance / deltaTime;
-    
-    return vel;
-}
-
-//******************************************************************************************************************
-// Function that configures the H-Bridge to control forward or reverse motion of each wheel based on PWM values and direction.
-//
-// This function sets the PWM for each motor pin depending on the motion direction and update mode.
-//
-// @param reverse Boolean indicating whether to move in reverse (true) or forward (false).
-// @param update Mode to update specific wheels: 1 for right, 2 for left, 3 for both.
-// @param pwmRightWheel PWM value for the right wheel.
-// @param pwmLeftWheel PWM value for the left wheel.
-//******************************************************************************************************************
-void configureHBridge(bool reverse, int update, int pwmRightWheel, int pwmLeftWheel){
-
-    // Check if right wheel should be updated (update == 1 or update == 3)
-    if (update == 1 || update == 3) {
-        if (!reverse) { // Set right wheel for forward direction
-            analogWrite(rightMotorM1, pwmRightWheel); // Apply PWM to right motor for forward motion
-            analogWrite(rightMotorM2, 0);             // Set right motor reverse pin to 0 (off)
-        } else { // Set right wheel for reverse direction
-            analogWrite(rightMotorM1, 0);             // Set right motor forward pin to 0 (off)
-            analogWrite(rightMotorM2, pwmRightWheel); // Apply PWM to right motor for reverse motion
-        }
-    }
-
-    // Check if left wheel should be updated (update == 2 or update == 3)
-    if (update == 2 || update == 3) {
-        if (!reverse) { // Set left wheel for forward direction
-            analogWrite(leftMotorM1, pwmLeftWheel); // Apply PWM to left motor for forward motion
-            analogWrite(leftMotorM2, 0);            // Set left motor reverse pin to 0 (off)
-        } else { // Set left wheel for reverse direction
-            analogWrite(leftMotorM1, 0);            // Set left motor forward pin to 0 (off)
-            analogWrite(leftMotorM2, pwmLeftWheel); // Apply PWM to left motor for reverse motion
-        }
-    }
-}
-
-
-//******************************************************************************************************************
-// Function that configures the H-Bridge for turning based on the specified direction and update mode.
-//
-// This function sets PWM values for each wheel's motor pins to achieve a clockwise or counterclockwise turn.
-//
-// @param counterClockwise Boolean indicating if the turn is counterclockwise (true) or clockwise (false).
-// @param update Mode to update specific wheels: 1 for right, 2 for left, 3 for both.
-// @param pwmRightWheel PWM value for the right wheel.
-// @param pwmLeftWheel PWM value for the left wheel.
-//******************************************************************************************************************
-void configureHBridgeTurn(bool counterClockwise, int update, int pwmRightWheel, int pwmLeftWheel){
-
-    // Check if right wheel should be updated (update == 1 or update == 3)
-    if (update == 1 || update == 3) {
-        if (!counterClockwise) { // Set right wheel for clockwise turn
-            analogWrite(rightMotorM1, 0);  // Right motor pin M1 set to 0
-            analogWrite(rightMotorM2, pwmRightWheel); // Right motor pin M2 set to PWM value
-        } else { // Set right wheel for counterclockwise turn
-            analogWrite(rightMotorM1, pwmRightWheel); // Right motor pin M1 set to PWM value
-            analogWrite(rightMotorM2, 0);  // Right motor pin M2 set to 0
-        }
-    }
-
-    // Check if left wheel should be updated (update == 2 or update == 3)
-    if (update == 2 || update == 3) {
-        if (!counterClockwise) { // Set left wheel for clockwise turn
-            analogWrite(leftMotorM1, pwmLeftWheel); // Left motor pin M1 set to PWM value
-            analogWrite(leftMotorM2, 0);  // Left motor pin M2 set to 0
-        } else { // Set left wheel for counterclockwise turn
-            analogWrite(leftMotorM1, 0);  // Left motor pin M1 set to 0
-            analogWrite(leftMotorM2, pwmLeftWheel); // Left motor pin M2 set to PWM value
-        }
-    }
-}
-
-//******************************************************************************************************************
-// Function that calculates the average linear distance traveled by the robot based on encoder pulses.
-//
-// This function converts the pulse count from both wheels to a linear distance, then averages both distances.
-//
-// @param leftPulseCount Pulse count for the left wheel encoder.
-// @param rightPulseCount Pulse count for the right wheel encoder.
-//
-// @return The average distance traveled in mm.
-//******************************************************************************************************************
-float calculateLinearDistanceTraveled(long leftPulseCount, long rightPulseCount) {
-
-  // Wheel circumference in mm
-  float wheelCircumference = 2 * PI * wheelRadius;
-
-  // Full revolutions based on the number of pulses
-  float rightRevolutions = (float) rightPulseCount / rightPulsesPerRev;
-  float leftRevolutions = (float) leftPulseCount / leftPulsesPerRev;
-
-  // Distance traveled in mm
-  float rightDistance = rightRevolutions * wheelCircumference;
-  float leftDistance = leftRevolutions * wheelCircumference;
-
-  // Calculate the average linear distance
-  float linearDistance = (rightDistance + leftDistance) / 2.0;
-
-  return linearDistance;
-}
-
-
-//******************************************************************************************************************
-// Function that calculates the linear distance required for the robot to achieve a desired turning angle.
-//
-// This function computes the distance based on the angle input, assuming a circular path defined by the distance 
-// between the wheels.
-//
-// @param desiredAngle The angle in degrees that the robot needs to turn.
-//
-// @return The calculated linear distance in mm required to achieve the desired turn.
-//******************************************************************************************************************
-float calculateLinearDistanceDesired(int desiredAngle) {
-
-  // Calculate the linear distance based on the desired angle, assuming a circular path
-  // Formula: (desiredAngle / 360) * π * distanceWheelToWheel
-  float linearDesiredDistance = (desiredAngle / 360.0) * PI * distanceWheelToWheel;
-
-  // Return the calculated linear distance
-  return linearDesiredDistance;
 }
 
 //******************************************************************************************************************
